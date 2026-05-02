@@ -1,0 +1,4 @@
+Zip -> City
+City -> State
+Salary -> Rate
+MaritalStatus,HasChild -> Rate

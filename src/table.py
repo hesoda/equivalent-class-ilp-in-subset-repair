@@ -117,6 +117,7 @@ class Table:
 
     def __repr__(self):
         _df = self.df.copy()
+        _df[self.representative_column] = _df[self.representative_column].astype(object)
         if self.representative_column:
             for index in self.df.index:
                 color = _df.at[index, self.representative_column]

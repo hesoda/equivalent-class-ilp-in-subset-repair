@@ -1,0 +1,8 @@
+Phone -> State
+Phone -> Zip
+Phone -> City
+Zip -> City
+Zip -> State
+Zip -> AreaCode
+City -> State
+s
