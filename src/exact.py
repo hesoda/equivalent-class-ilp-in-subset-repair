@@ -25,9 +25,14 @@ def exact_by_grb_ilp(t, delta, rc, seed):
     # add seed
     if seed is not None:
         m.Params.Seed = seed
-    x = []
+    n_rows = t.df.shape[0]
 
-    for i in range(t.df.shape[0]):
+    # x_i = 1 means tuple i is deleted; x_i = 0 means tuple i is retained.
+    # This is the complement of the previous keep-indicator encoding, but the
+    # feasible repairs are unchanged because conflicts are still modeled by
+    # requiring at least one endpoint of every conflict edge to be deleted.
+    x = []
+    for i in range(n_rows):
         x.append(m.addVar(vtype=GRB.BINARY, name=f"r{i}"))
 
     # add constraints for FDs
@@ -43,28 +48,29 @@ def exact_by_grb_ilp(t, delta, rc, seed):
                 for j in range(i + 1, len(all_idxs)):
                     for ii in all_idxs[i]:
                         for jj in all_idxs[j]:
-                            if (ii, jj) not in added:
-                                m.addConstr(x[ii] + x[jj] <= 1)
-                                added[(ii, jj)] = 1
+                            edge = (min(ii, jj), max(ii, jj))
+                            if edge not in added:
+                                m.addConstr(x[edge[0]] + x[edge[1]] >= 1)
+                                added[edge] = 1
 
-    # add constraints for RC
+    # add constraints for RC over retained tuples. Since x is a delete indicator,
+    # retained_count = original_count - deleted_count.
+    total_deleted = gb.quicksum(x)
+    total_kept = n_rows - total_deleted
     for color in range(t.color_distribution.c):
-        expr = gb.LinExpr()
-        for idx, _ in t.df[t.df[t.representative_column] == color].iterrows():
-            expr += x[idx]
-        expr -= gb.quicksum(x) * rc.constraint[t.labels[color]]
-        m.addLConstr(expr, GRB.GREATER_EQUAL, 0)
+        color_idxs = t.df[t.df[t.representative_column] == color].index
+        color_deleted = gb.quicksum(x[idx] for idx in color_idxs)
+        color_kept = len(color_idxs) - color_deleted
+        rc_val = rc.constraint[t.labels[color]]
+        m.addConstr(color_kept >= rc_val * total_kept, name=f"rc_{color}")
 
-    m.setObjective(gb.quicksum(x), GRB.MAXIMIZE)
+    m.setObjective(total_deleted, GRB.MINIMIZE)
     m.Params.LogToConsole = 0
     m.optimize()
 
     assert m.status == GRB.OPTIMAL
 
-    idxs = []
-    for v in m.getVars():
-        if v.VarName != "ans" and v.X != 0:
-            idxs.append(int(v.VarName[1:]))
+    idxs = [i for i, v in enumerate(x) if v.X < 0.5]
     t0 = Table(t.representative_column, t.df.iloc[idxs], t.labels)
     map[t0.color_distribution] = t0
     return map
