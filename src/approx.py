@@ -5,7 +5,8 @@ import numpy as np
 from utility import global_random_seed, eps
 from color_distribution import ColorDistribution
 import copy
-
+import networkx as nx  # <-- 补充引入 networkx
+import pandas as pd    # <-- 补充引入 pandas
 
 def approx(t, delta, rc, method="GRB_LP_ROUNDING", seed=None):
     if method in [
@@ -16,6 +17,13 @@ def approx(t, delta, rc, method="GRB_LP_ROUNDING", seed=None):
         return approx_by_grb_lp_rounding(
             t, delta, rc, rounding_method=method[4:], seed=seed
         )
+    elif method == "CC_LP": # <-- 补充 CC-LP 路由分支
+        return cc_lp_approx(t, delta, rc, seed=seed)
+    elif method == "TE_LP":
+        return te_lp_approx(t, delta, seed=seed)
+    elif method == "ET_TE_LP":
+        return et_te_lp_approx(t, delta, seed=seed)
+        
     raise ValueError("Not Supported Optimizer")
 
 
@@ -184,3 +192,573 @@ def _compute_adj(edges):
         adj[edges[id][0]].append(edges[id][1])
         adj[edges[id][1]].append(edges[id][0])
     return adj
+
+
+# ==========================================
+# TE-LP / et-TE-LP Baselines (Miao et al.)
+# ==========================================
+
+def _normalize_lp_value(val, half_eps=1e-6):
+    if val <= eps:
+        return 0.0
+    if abs(val - 0.5) <= half_eps:
+        return 0.5
+    if val >= 1.0 - eps:
+        return 1.0
+    return val
+
+
+def _build_conflict_edges_for_active(t, delta, active_tids):
+    edges = set()
+    if not active_tids:
+        return []
+
+    sub_df = t.df.loc[active_tids]
+
+    for fd in delta.fds:
+        if len(fd.lhs.cols) == 0:
+            lhs_groups = {("dummy_lhs",): sub_df.index.tolist()}
+        else:
+            lhs_groups = sub_df.groupby(fd.lhs.cols).groups
+
+        for _, lhs_idxs in lhs_groups.items():
+            rhs_grouped = sub_df.loc[lhs_idxs].groupby(fd.rhs.col)
+            rhs_groups = [rhs_idxs.tolist() for _, rhs_idxs in rhs_grouped.groups.items()]
+
+            for i in range(len(rhs_groups)):
+                for j in range(i + 1, len(rhs_groups)):
+                    for ii in rhs_groups[i]:
+                        for jj in rhs_groups[j]:
+                            u, v = (ii, jj) if ii < jj else (jj, ii)
+                            edges.add((u, v))
+    return list(edges)
+
+
+def _find_triad_same_fd(t, delta, active_set, residual_weight):
+    if not active_set:
+        return None
+
+    sub_df = t.df.loc[list(active_set)]
+
+    for fd in delta.fds:
+        if len(fd.lhs.cols) == 0:
+            lhs_groups = {("dummy_lhs",): sub_df.index.tolist()}
+        else:
+            lhs_groups = sub_df.groupby(fd.lhs.cols).groups
+
+        for _, lhs_idxs in lhs_groups.items():
+            rhs_grouped = sub_df.loc[lhs_idxs].groupby(fd.rhs.col)
+            picked = []
+            for _, rhs_idxs in rhs_grouped.groups.items():
+                chosen_tid = None
+                for tid in rhs_idxs:
+                    if residual_weight.get(tid, 0.0) > eps:
+                        chosen_tid = tid
+                        break
+                if chosen_tid is not None:
+                    picked.append(chosen_tid)
+                if len(picked) >= 3:
+                    return picked[0], picked[1], picked[2]
+    return None
+
+
+def _trim_instance_te_lp(t, delta, active_tids, orig_weights):
+    residual_weight = {tid: orig_weights[tid] for tid in active_tids}
+    active_set = set(active_tids)
+
+    while True:
+        triad = _find_triad_same_fd(t, delta, active_set, residual_weight)
+        if triad is None:
+            break
+        w_min = min(residual_weight[tid] for tid in triad)
+        for tid in triad:
+            residual_weight[tid] -= w_min
+            if residual_weight[tid] <= eps:
+                residual_weight[tid] = 0.0
+                active_set.discard(tid)
+
+    return active_set, residual_weight
+
+
+def _find_sigma_partition(t, delta, active_tids):
+    partitions = [set(active_tids)]
+    df = t.df
+
+    for fd in delta.fds:
+        new_partitions = []
+        for K in partitions:
+            if not K:
+                continue
+            K1, K2 = set(), set()
+            lhs_to_rhs = {}
+
+            for tid in sorted(K):
+                row = df.loc[tid]
+                lhs_val = tuple(row[col] for col in fd.lhs.cols)
+                rhs_val = row[fd.rhs.col]
+                if lhs_val not in lhs_to_rhs or lhs_to_rhs[lhs_val] == rhs_val:
+                    lhs_to_rhs[lhs_val] = rhs_val
+                    K1.add(tid)
+                else:
+                    K2.add(tid)
+
+            if K1:
+                new_partitions.append(K1)
+            if K2:
+                new_partitions.append(K2)
+        partitions = new_partitions
+
+    return partitions
+
+
+def _solve_bl_lp(t, delta, active_tids, residual_weight, seed=None):
+    edges = _build_conflict_edges_for_active(t, delta, active_tids)
+
+    m = gb.Model()
+    if seed is not None:
+        m.Params.Seed = seed
+    m.Params.LogToConsole = 0
+
+    x = m.addVars(active_tids, vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name="x")
+
+    for u, v in edges:
+        m.addConstr(x[u] + x[v] >= 1)
+
+    obj = gb.quicksum(residual_weight[tid] * x[tid] for tid in active_tids)
+    m.setObjective(obj, GRB.MINIMIZE)
+    m.optimize()
+
+    assert m.status == GRB.OPTIMAL
+
+    x_vals = {tid: _normalize_lp_value(x[tid].X) for tid in active_tids}
+    return x_vals
+
+
+def _te_lp_keep_ids(t, delta, seed=None, active_tids=None, orig_weights=None):
+    if active_tids is None:
+        active_tids = list(range(t.nrows()))
+    if orig_weights is None:
+        orig_weights = {tid: 1.0 for tid in active_tids}
+
+    active_set, residual_weight = _trim_instance_te_lp(
+        t, delta, active_tids, orig_weights
+    )
+    active_list = sorted(active_set)
+    if not active_list:
+        return []
+
+    partitions = _find_sigma_partition(t, delta, active_list)
+    x_vals = _solve_bl_lp(t, delta, active_list, residual_weight, seed=seed)
+
+    best_K = set()
+    max_half_weight = -1.0
+    for K in partitions:
+        current_weight = sum(
+            residual_weight[tid]
+            for tid in K
+            if abs(x_vals[tid] - 0.5) <= 1e-6
+        )
+        if current_weight > max_half_weight:
+            max_half_weight = current_weight
+            best_K = set(K)
+
+    keep_idxs = []
+    for tid in active_list:
+        val = x_vals[tid]
+        if val <= eps:
+            keep_idxs.append(tid)
+        elif abs(val - 0.5) <= 1e-6 and tid in best_K:
+            keep_idxs.append(tid)
+
+    return keep_idxs
+
+
+def te_lp_approx(t, delta, seed=None):
+    keep_idxs = _te_lp_keep_ids(t, delta, seed=seed)
+    if not keep_idxs:
+        empty_t = t.get_empty_table()
+        return {empty_t.color_distribution: empty_t}
+
+    t0 = Table(
+        t.representative_column,
+        t.df.iloc[keep_idxs].reset_index(drop=True),
+        t.labels,
+    )
+    return {t0.color_distribution: t0}
+
+
+def _eliminate_quasi_turan_clusters(t, delta, active_tids, orig_weights, h):
+    sub_df = t.df.loc[active_tids]
+    candidates = []
+
+    for fd in delta.fds:
+        if len(fd.lhs.cols) == 0:
+            lhs_groups = {("dummy_lhs",): sub_df.index.tolist()}
+        else:
+            lhs_groups = sub_df.groupby(fd.lhs.cols).groups
+
+        for lhs_val, lhs_idxs in lhs_groups.items():
+            rhs_grouped = sub_df.loc[lhs_idxs].groupby(fd.rhs.col)
+            if not rhs_grouped.groups:
+                continue
+
+            total_w = sum(orig_weights[tid] for tid in lhs_idxs)
+            max_bucket = 0.0
+            for _, rhs_idxs in rhs_grouped.groups.items():
+                bucket_w = sum(orig_weights[tid] for tid in rhs_idxs)
+                if bucket_w > max_bucket:
+                    max_bucket = bucket_w
+
+            if total_w >= (h + 1) * max_bucket:
+                candidates.append(
+                    {
+                        "tuple_ids": set(lhs_idxs),
+                        "total_weight": total_w,
+                        "lhs_key": lhs_val,
+                    }
+                )
+
+    candidates.sort(
+        key=lambda c: (-c["total_weight"], len(c["tuple_ids"]), str(c["lhs_key"]))
+    )
+
+    eliminated = set()
+    for c in candidates:
+        if c["tuple_ids"].isdisjoint(eliminated):
+            eliminated.update(c["tuple_ids"])
+
+    return set(active_tids) - eliminated
+
+
+def et_te_lp_approx(t, delta, seed=None, h_values=None):
+    all_tids = list(range(t.nrows()))
+    if not all_tids:
+        empty_t = t.get_empty_table()
+        return {empty_t.color_distribution: empty_t}
+
+    orig_weights = {tid: 1.0 for tid in all_tids}
+
+    if h_values is None:
+        h_values = range(2, len(all_tids))
+        if len(all_tids) < 3:
+            h_values = []
+
+    if not h_values:
+        return te_lp_approx(t, delta, seed=seed)
+
+    best_keep = []
+    best_cost = float("inf")
+
+    for h in h_values:
+        active_set = _eliminate_quasi_turan_clusters(
+            t, delta, all_tids, orig_weights, h
+        )
+        keep_idxs = _te_lp_keep_ids(
+            t,
+            delta,
+            seed=seed,
+            active_tids=sorted(active_set),
+            orig_weights=orig_weights,
+        )
+        keep_set = set(keep_idxs)
+        cost = sum(orig_weights[tid] for tid in all_tids if tid not in keep_set)
+
+        if cost < best_cost:
+            best_cost = cost
+            best_keep = keep_idxs
+
+    if not best_keep:
+        empty_t = t.get_empty_table()
+        return {empty_t.color_distribution: empty_t}
+
+    t0 = Table(
+        t.representative_column,
+        t.df.iloc[sorted(best_keep)].reset_index(drop=True),
+        t.labels,
+    )
+    return {t0.color_distribution: t0}
+
+
+# ==========================================
+# CC-LP (Conflict Clique LP) Algorithm Suite
+# ==========================================
+
+class CCLPState:
+    def __init__(self, t: Table, delta):
+        self.t = t
+        self.delta = delta
+        # 初始化元组权重，默认基准权重为 1.0。若有其他外部权重设定(如 RC)，可在此调整
+        self.tuples = {i: {'weight': 1.0, 'ec_refs': []} for i in range(t.nrows())}
+        self.ecs = {} 
+        self.ccs = {} 
+        self._build_indices()
+
+    def _build_indices(self):
+        """Stage 0: 构建三层交叉引用"""
+        ec_counter = 0
+        cc_counter = 0
+        df = self.t.df
+
+        for fd_id, fd in enumerate(self.delta.fds):
+            lhs_cols = fd.lhs.cols
+            rhs_col = fd.rhs.col
+
+            if len(lhs_cols) == 0:
+                groups = {("dummy_lhs",): df.index.tolist()}
+            else:
+                grouped = df.groupby(lhs_cols)
+                groups = grouped.groups
+
+            for lhs_val, idxs in groups.items():
+                cc_id = cc_counter
+                cc_counter += 1
+                self.ccs[cc_id] = {'fd_id': fd_id, 'ec_ids': []}
+
+                sub_df = df.loc[idxs]
+                rhs_grouped = sub_df.groupby(rhs_col)
+
+                for rhs_val, ec_idxs in rhs_grouped.groups.items():
+                    ec_id = ec_counter
+                    ec_counter += 1
+                    tuple_ids = ec_idxs.tolist()
+                    weight = len(tuple_ids) * 1.0 
+
+                    self.ecs[ec_id] = {
+                        'fd_id': fd_id,
+                        'tuple_ids': tuple_ids,
+                        'cc_id': cc_id,
+                        'weight': weight
+                    }
+                    self.ccs[cc_id]['ec_ids'].append(ec_id)
+
+                    for tid in tuple_ids:
+                        self.tuples[tid]['ec_refs'].append(ec_id)
+
+    def get_active_ec_count(self, cc_id):
+        return sum(1 for eid in self.ccs[cc_id]['ec_ids'] if self.ecs[eid]['weight'] > 1e-9)
+
+    def intra_fd_trim(self):
+        """Stage 1: 宏观等价类清剿"""
+        for fd_id, fd in enumerate(self.delta.fds):
+            fd_ccs = [cc_id for cc_id, cc in self.ccs.items() if cc['fd_id'] == fd_id]
+            for cc_id in fd_ccs:
+                while self.get_active_ec_count(cc_id) >= 3:
+                    cc = self.ccs[cc_id]
+                    active_ecs = [eid for eid in cc['ec_ids'] if self.ecs[eid]['weight'] > 1e-9]
+                    
+                    min_ec_id = min(active_ecs, key=lambda eid: self.ecs[eid]['weight'])
+                    w_min = self.ecs[min_ec_id]['weight']
+
+                    for eid in active_ecs:
+                        ec = self.ecs[eid]
+                        ratio = w_min / ec['weight']
+
+                        for tid in ec['tuple_ids']:
+                            t_obj = self.tuples[tid]
+                            deduction = t_obj['weight'] * ratio
+                            
+                            if deduction > 1e-9:
+                                t_obj['weight'] -= deduction
+                                for ref_eid in t_obj['ec_refs']:
+                                    self.ecs[ref_eid]['weight'] -= deduction
+
+def build_residual_conflict_graph(state: CCLPState) -> nx.Graph:
+    """基于残余权重大于 0 的 Tuple，构建跨 FD 的无向冲突图"""
+    G = nx.Graph()
+    for tid, t_obj in state.tuples.items():
+        if t_obj['weight'] > 1e-9:
+            G.add_node(tid)
+            
+    for cc_id, cc in state.ccs.items():
+        active_ecs = []
+        for eid in cc['ec_ids']:
+            alive_tuples_in_ec = [tid for tid in state.ecs[eid]['tuple_ids'] if state.tuples[tid]['weight'] > 1e-9]
+            if alive_tuples_in_ec:
+                active_ecs.append(alive_tuples_in_ec)
+                
+        if len(active_ecs) >= 2:
+            for i in range(len(active_ecs)):
+                for j in range(i + 1, len(active_ecs)):
+                    for u in active_ecs[i]:
+                        for v in active_ecs[j]:
+                            G.add_edge(u, v)
+    return G
+
+def cross_fd_trim(state: CCLPState):
+    """Stage 2: 微观图论扫尾 (基于 Chiba-Nishizeki 思路寻找三角形)"""
+    while True:
+        G = build_residual_conflict_graph(state)
+        if G.number_of_edges() == 0:
+            break
+            
+        degrees = dict(G.degree())
+        DAG = nx.DiGraph()
+        DAG.add_nodes_from(G.nodes())
+        
+        for u, v in G.edges():
+            if degrees[u] < degrees[v]:
+                DAG.add_edge(u, v)
+            elif degrees[u] > degrees[v]:
+                DAG.add_edge(v, u)
+            else:
+                if u < v: DAG.add_edge(u, v)
+                else: DAG.add_edge(v, u)
+                    
+        triangles_eliminated = 0
+        for u in DAG.nodes():
+            if state.tuples[u]['weight'] <= 1e-9: continue
+            out_neighbors_u = set(DAG.successors(u))
+            for v in out_neighbors_u:
+                if state.tuples[v]['weight'] <= 1e-9: continue
+                out_neighbors_v = set(DAG.successors(v))
+                for w in out_neighbors_v:
+                    if state.tuples[w]['weight'] <= 1e-9: continue
+                    if G.has_edge(u, w):
+                        w_min = min(state.tuples[u]['weight'], state.tuples[v]['weight'], state.tuples[w]['weight'])
+                        if w_min > 1e-9:
+                            state.tuples[u]['weight'] -= w_min
+                            state.tuples[v]['weight'] -= w_min
+                            state.tuples[w]['weight'] -= w_min
+                            triangles_eliminated += 1
+                            
+        if triangles_eliminated == 0:
+            break
+
+def cc_lp_approx(t, delta, rc, seed=None):
+    """
+    Stage 3 & 主控函数: 包含 LP 建模、Sigma-Partition 划分与舍入逻辑
+    """
+    # 1. 执行前置清洗
+    state = CCLPState(t, delta)
+    state.intra_fd_trim()  # Stage 1
+    cross_fd_trim(state)   # Stage 2
+    
+    # 2. 提取残余实例 I' (仅保留残余权重 > 0 的元组)
+    residual_tids = [tid for tid, obj in state.tuples.items() if obj['weight'] > 1e-9]
+    if not residual_tids:
+        # 如果全部死光了（极端冲突），返回空表
+        empty_t = t.get_empty_table()
+        return {empty_t.color_distribution: empty_t}
+
+    # 3. Algorithm 4: FindPartition (获取大小受限的 Sigma-Partition)
+    partitions = [set(residual_tids)]
+    for fd in delta.fds:
+        new_partitions = []
+        for K in partitions:
+            if not K: continue
+            K1, K2 = set(), set()
+            lhs_to_rhs = {}
+            for tid in K:
+                row = t.df.iloc[tid]
+                # 提取 LHS 和 RHS 的值
+                lhs_val = tuple(row[col] for col in fd.lhs.cols)
+                rhs_val = row[fd.rhs.col]
+                
+                # 贪心分组：如果加入 K1 不违背当前 fd，则放入 K1，否则放入 K2
+                if lhs_val not in lhs_to_rhs:
+                    lhs_to_rhs[lhs_val] = rhs_val
+                    K1.add(tid)
+                elif lhs_to_rhs[lhs_val] == rhs_val:
+                    K1.add(tid)
+                else:
+                    K2.add(tid)
+            if K1: new_partitions.append(K1)
+            if K2: new_partitions.append(K2)
+        partitions = new_partitions
+
+    # 4. 构建 MINIMIZE 视角的 半整数规划 (MHIP) - 等价类降维版
+    m = gb.Model()
+    m.Params.LogToConsole = 1
+    if seed is not None:
+        m.Params.Seed = seed
+
+
+    x = {}
+    y = {} # 新增：等价类辅助变量
+
+    # 4.1 定义元组变量 X
+    for tid in residual_tids:
+        # x_i 代表删除指示器
+        x[tid] = m.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"x{tid}")
+
+    # 4.2 定义等价类变量 Y，并构建 O(N) 降维约束
+    for fd_id, fd in enumerate(delta.fds):
+        fd_ccs = [cc_id for cc_id, cc in state.ccs.items() if cc['fd_id'] == fd_id]
+        
+        for cc_id in fd_ccs:
+            cc = state.ccs[cc_id]
+            # 找出该 CC 中还有存活元组的 EC
+            active_ec_ids = []
+            for eid in cc['ec_ids']:
+                alive_tuples = [tid for tid in state.ecs[eid]['tuple_ids'] if tid in residual_tids]
+                if alive_tuples:
+                    active_ec_ids.append((eid, alive_tuples))
+            
+            # 由于图已经是无三角形的，这里的 active_ec_ids 长度严格 <= 2
+            if len(active_ec_ids) == 2:
+                eid_u, tuples_u = active_ec_ids[0]
+                eid_v, tuples_v = active_ec_ids[1]
+                
+                # 为这两个 EC 注册 Y 变量 (如果还没注册的话)
+                if eid_u not in y:
+                    y[eid_u] = m.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"y{eid_u}")
+                    # 层次连结约束 1: y_u <= x_i
+                    for tid in tuples_u:
+                        m.addConstr(y[eid_u] <= x[tid])
+                        
+                if eid_v not in y:
+                    y[eid_v] = m.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"y{eid_v}")
+                    # 层次连结约束 2: y_v <= x_j
+                    for tid in tuples_v:
+                        m.addConstr(y[eid_v] <= x[tid])
+                
+                # 核心降维团约束：替代原本 N*M 条的 x_i + x_j >= 1
+                m.addConstr(y[eid_u] + y[eid_v] >= 1)
+
+    # 目标函数：最小化被删除的权值 (使用元组的残余血量)
+    obj_expr = gb.LinExpr()
+    for tid in residual_tids:
+        obj_expr += state.tuples[tid]['weight'] * x[tid]
+    m.setObjective(obj_expr, GRB.MINIMIZE)
+
+    print("Start Optimization (Equivalence Class Encoding)")
+    m.update()
+    print(f"--- Gurobi Model Stats ---")
+    print(f"Variables: {m.NumVars}, Constraints: {m.NumConstrs}, NNZ: {m.NumNZs}")
+    m.optimize()
+    assert m.status == GRB.OPTIMAL
+
+    # 5. Algorithm 1: 基于 Sigma-Partition 的舍入策略 (Rounding)
+    x_vals = {tid: x[tid].X for tid in residual_tids}
+    
+    # 寻找包含最多 1/2 权重分数解的 Partition K*
+    best_K = None
+    max_half_weight = -1.0
+    for K in partitions:
+        # 只统计 x_i = 1/2 的元组权重
+        current_weight = sum(state.tuples[tid]['weight'] for tid in K if 0.49 < x_vals[tid] < 0.51)
+        if current_weight > max_half_weight:
+            max_half_weight = current_weight
+            best_K = K
+            
+    if best_K is None:
+        best_K = set()
+
+    # 实施舍入: 
+    # x_i == 0 意味着绝对安全，保留该元组。
+    # x_i == 0.5 且属于 K*，被舍入为 0，保留该元组。
+    # 其他均被舍入为 1 (删除)。
+    keep_idxs = []
+    for tid in residual_tids:
+        val = x_vals[tid]
+        if val <= 0.01:
+            keep_idxs.append(tid)
+        elif 0.49 < val < 0.51 and tid in best_K:
+            keep_idxs.append(tid)
+
+    # 6. 生成子集修复结果
+    t0 = Table(t.representative_column, t.df.iloc[keep_idxs].reset_index(drop=True), t.labels)
+    
+    # 返回要求的数据格式映射
+    res_map = {t0.color_distribution: t0}
+    return res_map

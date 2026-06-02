@@ -84,6 +84,18 @@ def solve(t, delta, rc, res_dir, solver=[], prefix="default", seed=None, report_
                     repairs = approx(
                         t, delta, rc, "GRB_LP_NEW_GREEDY_ROUNDING", seed=seed
                     )
+                case "cc_lp":
+                    repairs = run_with_profiler(
+                        approx, t, delta, rc, method="CC_LP", seed=seed
+                    )
+                case "te_lp":
+                    repairs = run_with_profiler(
+                        approx, t, delta, rc, method="TE_LP", seed=seed
+                    )
+                case "et_te_lp":
+                    repairs = run_with_profiler(
+                        approx, t, delta, rc, method="ET_TE_LP", seed=seed
+                    )
                 case "fdcleanser":
                     repairs = run_with_profiler(s_repair,
                         t, delta, rc, AfterReduction.MOST_FREQUENT_COL, seed=seed
@@ -197,7 +209,7 @@ if __name__ == "__main__":
         "--solvers",
         type=str,
         default="globailp",
-        help="comma-separated list of solvers, [lhschain_dp,globalilp,lp_greedyrounding,lp_reprrounding,fdcleanser,dp_baseline,vc_approx_baseline,ilp_baseline]",
+        help="comma-separated list of solvers, [lhschain_dp,globalilp,lp_greedyrounding,lp_reprrounding,cc_lp,te_lp,et_te_lp,fdcleanser,dp_baseline,vc_approx_baseline,ilp_baseline]",
     )
     parser.add_argument(
         "--report_violation",
