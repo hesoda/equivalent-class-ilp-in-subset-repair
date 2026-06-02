@@ -5,8 +5,7 @@ import numpy as np
 from utility import global_random_seed, eps
 from color_distribution import ColorDistribution
 import copy
-import networkx as nx  # <-- 补充引入 networkx
-import pandas as pd    # <-- 补充引入 pandas
+
 
 def approx(t, delta, rc, method="GRB_LP_ROUNDING", seed=None):
     if method in [
@@ -483,18 +482,21 @@ def et_te_lp_approx(t, delta, seed=None, h_values=None):
 # CC-LP (Conflict Clique LP) Algorithm Suite
 # ==========================================
 
+CC_LP_EPS = 1e-9
+
+
 class CCLPState:
     def __init__(self, t: Table, delta):
         self.t = t
         self.delta = delta
-        # 初始化元组权重，默认基准权重为 1.0。若有其他外部权重设定(如 RC)，可在此调整
+        # Residual tuple mass used by CC-LP trimming and by the residual LP.
         self.tuples = {i: {'weight': 1.0, 'ec_refs': []} for i in range(t.nrows())}
-        self.ecs = {} 
-        self.ccs = {} 
+        self.ecs = {}
+        self.ccs = {}
         self._build_indices()
 
     def _build_indices(self):
-        """Stage 0: 构建三层交叉引用"""
+        """Stage 0: Build tuple/EC/CC cross references for every FD."""
         ec_counter = 0
         cc_counter = 0
         df = self.t.df
@@ -512,7 +514,7 @@ class CCLPState:
             for lhs_val, idxs in groups.items():
                 cc_id = cc_counter
                 cc_counter += 1
-                self.ccs[cc_id] = {'fd_id': fd_id, 'ec_ids': []}
+                self.ccs[cc_id] = {'fd_id': fd_id, 'lhs_val': lhs_val, 'ec_ids': []}
 
                 sub_df = df.loc[idxs]
                 rhs_grouped = sub_df.groupby(rhs_col)
@@ -521,13 +523,14 @@ class CCLPState:
                     ec_id = ec_counter
                     ec_counter += 1
                     tuple_ids = ec_idxs.tolist()
-                    weight = len(tuple_ids) * 1.0 
+                    weight = len(tuple_ids) * 1.0
 
                     self.ecs[ec_id] = {
                         'fd_id': fd_id,
+                        'rhs_val': rhs_val,
                         'tuple_ids': tuple_ids,
                         'cc_id': cc_id,
-                        'weight': weight
+                        'weight': weight,
                     }
                     self.ccs[cc_id]['ec_ids'].append(ec_id)
 
@@ -535,103 +538,129 @@ class CCLPState:
                         self.tuples[tid]['ec_refs'].append(ec_id)
 
     def get_active_ec_count(self, cc_id):
-        return sum(1 for eid in self.ccs[cc_id]['ec_ids'] if self.ecs[eid]['weight'] > 1e-9)
+        return sum(
+            1
+            for eid in self.ccs[cc_id]['ec_ids']
+            if self.ecs[eid]['weight'] > CC_LP_EPS
+        )
 
-    def intra_fd_trim(self):
-        """Stage 1: 宏观等价类清剿"""
-        for fd_id, fd in enumerate(self.delta.fds):
-            fd_ccs = [cc_id for cc_id, cc in self.ccs.items() if cc['fd_id'] == fd_id]
-            for cc_id in fd_ccs:
-                while self.get_active_ec_count(cc_id) >= 3:
-                    cc = self.ccs[cc_id]
-                    active_ecs = [eid for eid in cc['ec_ids'] if self.ecs[eid]['weight'] > 1e-9]
-                    
-                    min_ec_id = min(active_ecs, key=lambda eid: self.ecs[eid]['weight'])
-                    w_min = self.ecs[min_ec_id]['weight']
+    def _deduct_tuple_weight(self, tid, deduction):
+        """Deduct tuple residual mass and synchronize every EC containing it."""
+        if deduction <= CC_LP_EPS:
+            return 0.0
 
-                    for eid in active_ecs:
-                        ec = self.ecs[eid]
-                        ratio = w_min / ec['weight']
+        t_obj = self.tuples[tid]
+        old_weight = t_obj['weight']
+        if old_weight <= CC_LP_EPS:
+            t_obj['weight'] = 0.0
+            return 0.0
 
-                        for tid in ec['tuple_ids']:
-                            t_obj = self.tuples[tid]
-                            deduction = t_obj['weight'] * ratio
-                            
-                            if deduction > 1e-9:
-                                t_obj['weight'] -= deduction
-                                for ref_eid in t_obj['ec_refs']:
-                                    self.ecs[ref_eid]['weight'] -= deduction
+        new_weight = max(0.0, old_weight - deduction)
+        actual_delta = old_weight - new_weight
+        if actual_delta <= CC_LP_EPS:
+            return 0.0
 
-def build_residual_conflict_graph(state: CCLPState) -> nx.Graph:
-    """基于残余权重大于 0 的 Tuple，构建跨 FD 的无向冲突图"""
-    G = nx.Graph()
-    for tid, t_obj in state.tuples.items():
-        if t_obj['weight'] > 1e-9:
-            G.add_node(tid)
-            
-    for cc_id, cc in state.ccs.items():
-        active_ecs = []
-        for eid in cc['ec_ids']:
-            alive_tuples_in_ec = [tid for tid in state.ecs[eid]['tuple_ids'] if state.tuples[tid]['weight'] > 1e-9]
-            if alive_tuples_in_ec:
-                active_ecs.append(alive_tuples_in_ec)
-                
-        if len(active_ecs) >= 2:
-            for i in range(len(active_ecs)):
-                for j in range(i + 1, len(active_ecs)):
-                    for u in active_ecs[i]:
-                        for v in active_ecs[j]:
-                            G.add_edge(u, v)
-    return G
+        t_obj['weight'] = 0.0 if new_weight <= CC_LP_EPS else new_weight
 
-def cross_fd_trim(state: CCLPState):
-    """Stage 2: 微观图论扫尾 (基于 Chiba-Nishizeki 思路寻找三角形)"""
-    while True:
-        G = build_residual_conflict_graph(state)
-        if G.number_of_edges() == 0:
-            break
-            
-        degrees = dict(G.degree())
-        DAG = nx.DiGraph()
-        DAG.add_nodes_from(G.nodes())
-        
-        for u, v in G.edges():
-            if degrees[u] < degrees[v]:
-                DAG.add_edge(u, v)
-            elif degrees[u] > degrees[v]:
-                DAG.add_edge(v, u)
-            else:
-                if u < v: DAG.add_edge(u, v)
-                else: DAG.add_edge(v, u)
-                    
-        triangles_eliminated = 0
-        for u in DAG.nodes():
-            if state.tuples[u]['weight'] <= 1e-9: continue
-            out_neighbors_u = set(DAG.successors(u))
-            for v in out_neighbors_u:
-                if state.tuples[v]['weight'] <= 1e-9: continue
-                out_neighbors_v = set(DAG.successors(v))
-                for w in out_neighbors_v:
-                    if state.tuples[w]['weight'] <= 1e-9: continue
-                    if G.has_edge(u, w):
-                        w_min = min(state.tuples[u]['weight'], state.tuples[v]['weight'], state.tuples[w]['weight'])
-                        if w_min > 1e-9:
-                            state.tuples[u]['weight'] -= w_min
-                            state.tuples[v]['weight'] -= w_min
-                            state.tuples[w]['weight'] -= w_min
-                            triangles_eliminated += 1
-                            
-        if triangles_eliminated == 0:
-            break
+        for ref_eid in t_obj['ec_refs']:
+            ec = self.ecs[ref_eid]
+            ec['weight'] = max(0.0, ec['weight'] - actual_delta)
+            if ec['weight'] <= CC_LP_EPS:
+                ec['weight'] = 0.0
+
+        return actual_delta
+
+    def _materialize_ec_deduction(self, eid, deduction_mass):
+        """
+        Apply an EC-level bulk deduction proportionally to the EC's tuples.
+
+        The EC snapshot is materialized through _deduct_tuple_weight so all
+        other FD/CC references of each touched tuple stay synchronized before
+        the next CC is processed.
+        """
+        ec = self.ecs[eid]
+        W = ec['weight']
+        if W <= CC_LP_EPS or deduction_mass <= CC_LP_EPS:
+            return 0.0
+
+        deduction_mass = min(deduction_mass, W)
+        ratio = deduction_mass / W
+
+        tuple_deductions = []
+        for tid in ec['tuple_ids']:
+            tuple_weight = self.tuples[tid]['weight']
+            if tuple_weight > CC_LP_EPS:
+                tuple_deductions.append((tid, tuple_weight * ratio))
+
+        actual_total = 0.0
+        for tid, tuple_deduction in tuple_deductions:
+            actual_total += self._deduct_tuple_weight(tid, tuple_deduction)
+
+        return actual_total
+
+    def _bulk_trim_one_cc(self, cc_id):
+        """
+        Water-fill one conflict clique: subtract the third-largest active EC
+        mass from every active EC, leaving at most two active RHS classes.
+        """
+        cc = self.ccs[cc_id]
+        active_ecs = [
+            eid for eid in cc['ec_ids']
+            if self.ecs[eid]['weight'] > CC_LP_EPS
+        ]
+        if len(active_ecs) <= 2:
+            return
+
+        active_ecs.sort(key=lambda eid: self.ecs[eid]['weight'], reverse=True)
+        tau = self.ecs[active_ecs[2]]['weight']
+        if tau <= CC_LP_EPS:
+            return
+
+        # Compute all EC-level deductions from the current CC snapshot first;
+        # then materialize each EC before moving on to another CC.
+        ec_deductions = {
+            eid: min(self.ecs[eid]['weight'], tau)
+            for eid in active_ecs
+            if min(self.ecs[eid]['weight'], tau) > CC_LP_EPS
+        }
+
+        for eid, deduction_mass in ec_deductions.items():
+            self._materialize_ec_deduction(eid, deduction_mass)
+
+        active_count = self.get_active_ec_count(cc_id)
+        if active_count > 2:
+            raise RuntimeError(
+                f"CC-LP bulk trim failed for CC {cc_id}: "
+                f"active_ec_count={active_count}"
+            )
+
+    def intra_fd_bulk_trim(self):
+        """
+        Stage 1: eliminate single-FD-induced triads with bulk water-filling.
+
+        Each CC (one FD plus one fixed LHS value) is processed at most once.
+        Since tuple/EC residual weights only decrease, later CCs cannot make a
+        previously processed CC regain a third active EC.
+        """
+        for cc_id in list(self.ccs.keys()):
+            if self.get_active_ec_count(cc_id) >= 3:
+                self._bulk_trim_one_cc(cc_id)
+
+        for cc_id in self.ccs:
+            active_count = self.get_active_ec_count(cc_id)
+            if active_count > 2:
+                raise RuntimeError(
+                    f"CC-LP Stage 1 invariant violated: CC {cc_id} "
+                    f"has {active_count} active ECs"
+                )
 
 def cc_lp_approx(t, delta, rc, seed=None):
     """
-    Stage 3 & 主控函数: 包含 LP 建模、Sigma-Partition 划分与舍入逻辑
+    主控函数: bulk trim、LP 建模、Sigma-Partition 划分与舍入逻辑
     """
-    # 1. 执行前置清洗
+    # 1. 执行 CC 内 bulk water-filling 清洗
     state = CCLPState(t, delta)
-    state.intra_fd_trim()  # Stage 1
-    cross_fd_trim(state)   # Stage 2
+    state.intra_fd_bulk_trim()  # Stage 1: bulk water-filling trim
     
     # 2. 提取残余实例 I' (仅保留残余权重 > 0 的元组)
     residual_tids = [tid for tid, obj in state.tuples.items() if obj['weight'] > 1e-9]
@@ -694,7 +723,12 @@ def cc_lp_approx(t, delta, rc, seed=None):
                 if alive_tuples:
                     active_ec_ids.append((eid, alive_tuples))
             
-            # 由于图已经是无三角形的，这里的 active_ec_ids 长度严格 <= 2
+            # Bulk trim 保证每个 CC 最多保留两个 active EC。
+            if len(active_ec_ids) > 2:
+                raise RuntimeError(
+                    f"CC-LP Stage 1 invariant violated before LP: CC {cc_id} "
+                    f"has {len(active_ec_ids)} active ECs"
+                )
             if len(active_ec_ids) == 2:
                 eid_u, tuples_u = active_ec_ids[0]
                 eid_v, tuples_v = active_ec_ids[1]
