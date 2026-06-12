@@ -22,9 +22,9 @@ from exact import (
 from approx import approx
 from time import time
 import numpy as np
-from utility import sanity_check, compute_pairwise_violations, compute_violated_tuples
+from utility import check_fds, check_rc, compute_pairwise_violations, compute_violated_tuples
 import warnings
-from postclean import postclean_for_set
+from postclean import postclean
 
 warnings.filterwarnings("ignore")
 
@@ -66,7 +66,7 @@ def load_data(table_filename, fds_filename, rc_filename):
     return t, delta, rc
 
 
-def solve(t, delta, rc, res_dir, solver=[], prefix="default", seed=None, report_violation=False):
+def solve(t, delta, rc, res_dir, solver=[], prefix="default", seed=None, report_violation=False, strict_sanity=False):
     for func_name in solver:
         with open(res_dir + prefix + "_" + func_name + ".txt", "w") as fout:
             start_ts = time()
@@ -84,15 +84,15 @@ def solve(t, delta, rc, res_dir, solver=[], prefix="default", seed=None, report_
                     repairs = approx(
                         t, delta, rc, "GRB_LP_NEW_GREEDY_ROUNDING", seed=seed
                     )
-                case "cc_lp":
+                case "cc_lp" | "cc-lp":
                     repairs = run_with_profiler(
                         approx, t, delta, rc, method="CC_LP", seed=seed
                     )
-                case "te_lp":
+                case "te_lp" | "te-lp":
                     repairs = run_with_profiler(
                         approx, t, delta, rc, method="TE_LP", seed=seed
                     )
-                case "et_te_lp":
+                case "et_te_lp" | "et-te-lp":
                     repairs = run_with_profiler(
                         approx, t, delta, rc, method="ET_TE_LP", seed=seed
                     )
@@ -149,10 +149,33 @@ def solve(t, delta, rc, res_dir, solver=[], prefix="default", seed=None, report_
                 case default:
                     raise ValueError("Unsupported Solver")
             # postclean_ts = time()
-            optimal = postclean_for_set(repairs, rc)
+            optimal = None
+            selected_subset_repair = None
+            subset_repair_nrows = 0
+            for _, repair in repairs.items():
+                postcleaned = postclean(repair, rc)
+                if optimal is None or postcleaned.nrows() > optimal.nrows():
+                    optimal = postcleaned
+                    selected_subset_repair = repair
+                    subset_repair_nrows = repair.nrows()
             end_ts = time()
-            # assert sanity_check(optimal, delta, rc)
+            fd_consistent_before = check_fds(selected_subset_repair, delta)
+            fd_consistent_after = check_fds(optimal, delta)
+            rc_qualified_after = check_rc(optimal, rc)
             fout.write(f"Overall Time cost(in secs.): {end_ts - start_ts}\n")
+            fout.write(f"Size of subset repair(before PostClean): {subset_repair_nrows}\n")
+            fout.write(f"Size of repair(after PostClean): {optimal.nrows()}\n")
+            fout.write(f"FD Consistent(before PostClean): {fd_consistent_before}\n")
+            fout.write(f"FD Consistent(after PostClean): {fd_consistent_after}\n")
+            fout.write(f"RC Qualified(after PostClean): {rc_qualified_after}\n")
+            # Strict subset-repair sanity checks FD consistency only.
+            # RC qualification is still reported above, but it is not part of
+            # subset-repair validity and should not fail these reruns.
+            if strict_sanity and not (fd_consistent_before and fd_consistent_after):
+                raise AssertionError(
+                    f"Sanity check failed for {func_name}: "
+                    f"fd_before={fd_consistent_before}, fd_after={fd_consistent_after}"
+                )
             # fout.write(f"Size of RS-repair: {optimal.nrows()}\n")
             # if report_violation:
             #     fout.write(
@@ -209,13 +232,19 @@ if __name__ == "__main__":
         "--solvers",
         type=str,
         default="globailp",
-        help="comma-separated list of solvers, [lhschain_dp,globalilp,lp_greedyrounding,lp_reprrounding,cc_lp,te_lp,et_te_lp,fdcleanser,dp_baseline,vc_approx_baseline,ilp_baseline]",
+        help="comma-separated list of solvers, [lhschain_dp,globalilp,lp_greedyrounding,lp_reprrounding,cc_lp/cc-lp,te_lp/te-lp,et_te_lp/et-te-lp,fdcleanser,dp_baseline,vc_approx_baseline,ilp_baseline]",
     )
     parser.add_argument(
         "--report_violation",
         action="store_true",
         default=False,
         help="(Optional) report the violations (in terms of FDs) of the tuples retained by the RS-repair",
+    )
+    parser.add_argument(
+        "--strict_sanity",
+        action="store_true",
+        default=False,
+        help="fail the run unless the selected subset repair and PostClean repair are FD-consistent; RC is reported but not enforced",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="(Optional) the random seed"
@@ -228,6 +257,7 @@ if __name__ == "__main__":
     rc_filename = dir + args.rc
     solvers = args.solvers.split(",")
     report_violation = args.report_violation
+    strict_sanity = args.strict_sanity
     seed = args.seed
 
     t, delta, rc = load_data(t_filename, fds_filename, rc_filename)
@@ -243,5 +273,6 @@ if __name__ == "__main__":
             prefix=args.relation,
             seed=seed,
             report_violation=report_violation,
+            strict_sanity=strict_sanity,
         )
         print("Finished!")

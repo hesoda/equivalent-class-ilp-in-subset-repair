@@ -158,12 +158,14 @@ def exact_by_grb_ilp_equiv_class_rc(t, delta, rc, seed):
             rhs_grouped = group_lhs.groupby(fd.rhs.col, dropna=False)
             K = len(rhs_grouped)
             
+            # y[k] has deletion-certificate semantics aligned with x:
+            # y[k] = 1 certifies that the whole RHS equivalence class is deleted.
             y = m.addVars(K, vtype=GRB.BINARY, name=f"y_{fd.lhs.cols}_{lhs_val}")
-            m.addConstr(y.sum() <= 1)
+            m.addConstr(y.sum() >= K - 1)
             
             for k, (rhs_val, group_rhs) in enumerate(rhs_grouped):
                 pos_idxs = group_rhs['_pos_idx'].values
-                m.addConstrs((x[pos] + y[k] >= 1 for pos in pos_idxs), name="bind")
+                m.addConstrs((y[k] <= x[pos] for pos in pos_idxs), name="bind")
 
     # ==========================================
     # 2. 添加 RC 全局比例约束 (Distribution/Fairness Constraints)
@@ -572,15 +574,17 @@ def relax_lp_equiv_class(t, delta, seed=None):
             
             y_vars = []
             for rhs_val, group_rhs in rhs_grouped:
+                # y has deletion-certificate semantics aligned with x:
+                # y = 1 certifies that this RHS equivalence class is fully deleted.
                 y = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=1.0, name=f"y_{y_var_counter}")
                 y_var_counter += 1
                 y_vars.append(y)
                 
                 pos_idxs = group_rhs['_pos_idx'].tolist()
                 for pos in pos_idxs:
-                    m.addConstr(x[pos] + y >= 1)
+                    m.addConstr(y <= x[pos])
                     
-            m.addConstr(gb.quicksum(y_vars) <= 1)
+            m.addConstr(gb.quicksum(y_vars) >= len(y_vars) - 1)
 
     m.setObjective(gb.quicksum(x), GRB.MINIMIZE)
     print("Start LP Relaxation (Equivalence Class Encoding)")
@@ -630,19 +634,21 @@ def exact_by_grb_ilp_equiv_class(t, delta, seed):
             K = len(rhs_grouped)
             
             # 【核心加速 3】：批量创建当前冲突组的 y 变量。
+            # y 与 x 的删除语义保持一致：1 表示删除证书。
+            # y[k] = 1 是“第 k 个 RHS 等价类整体被删除”的证书。
             y = m.addVars(K, vtype=GRB.BINARY, name=f"y_{fd.lhs.cols}_{lhs_val}")
             
             # 【核心加速 4】：使用 tupledict.sum() 替代 gb.quicksum()。
-            # x.sum() 和 y.sum() 是 Gurobi 为 tupledict 专门优化的 C 语言级别求和。
-            m.addConstr(y.sum() <= 1)
+            # 每个冲突团中至少 K-1 个等价类必须被整体删除，因此至多一个等价类可保留。
+            m.addConstr(y.sum() >= K - 1)
             
             for k, (rhs_val, group_rhs) in enumerate(rhs_grouped):
                 # 使用 .values 提取 numpy 数组，比 .tolist() 更快
                 pos_idxs = group_rhs['_pos_idx'].values
                 
                 # 【核心加速 5】：使用 addConstrs 结合 Python 生成器。
-                # 这会把整个约束生成的任务直接推送到 Gurobi 的 C++ 后端执行，速度提升极度夸张！
-                m.addConstrs((x[pos] + y[k] >= 1 for pos in pos_idxs), name="bind")
+                # 若 y[k]=1，则该等价类内所有 tuple 都必须删除，即 y[k] <= x[pos]。
+                m.addConstrs((y[k] <= x[pos] for pos in pos_idxs), name="bind")
 
     # 直接使用极速的 x.sum()
     m.setObjective(x.sum(), GRB.MINIMIZE)

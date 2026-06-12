@@ -770,7 +770,8 @@ def cc_lp_approx(t, delta, rc, seed=None):
     max_half_weight = -1.0
     for K in partitions:
         # 只统计 x_i = 1/2 的元组权重
-        current_weight = sum(state.tuples[tid]['weight'] for tid in K if 0.49 < x_vals[tid] < 0.51)
+        # current_weight = sum(state.tuples[tid]['weight'] for tid in K if 0.49 < x_vals[tid] < 0.51)
+        current_weight = sum(state.tuples[tid]['weight'] for tid in K if 0 < x_vals[tid] < 1.0)
         if current_weight > max_half_weight:
             max_half_weight = current_weight
             best_K = K
@@ -780,14 +781,15 @@ def cc_lp_approx(t, delta, rc, seed=None):
 
     # 实施舍入: 
     # x_i == 0 意味着绝对安全，保留该元组。
-    # x_i == 0.5 且属于 K*，被舍入为 0，保留该元组。
+    # x_i 为分数且属于 K*，被舍入为 0，保留该元组。
     # 其他均被舍入为 1 (删除)。
     keep_idxs = []
     for tid in residual_tids:
         val = x_vals[tid]
         if val <= 0.01:
             keep_idxs.append(tid)
-        elif 0.49 < val < 0.51 and tid in best_K:
+        # elif 0.49 < val < 0.51 and tid in best_K:
+        elif 0 < val < 1.0 and tid in best_K:
             keep_idxs.append(tid)
 
     # 6. 生成子集修复结果

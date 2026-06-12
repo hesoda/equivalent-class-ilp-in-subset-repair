@@ -38,14 +38,15 @@ def compute_violated_tuples(t, delta):
     return len(idx_to_is_violated)
 
 
-def check_fds(t, delta):
+def check_fds(t, delta, verbose=False):
     for fd in delta.fds:
         lhs_grouped = t.df.groupby(fd.lhs.cols)
         for _, lhs_idxs in lhs_grouped.groups.items():
             rhs_grouped = t.df.loc[lhs_idxs].groupby(fd.rhs.col)
             if len(list(rhs_grouped.groups.items())) > 1:
-                print("Error: FD violated")
-                print(rhs_grouped.groups)
+                if verbose:
+                    print("Error: FD violated")
+                    print(rhs_grouped.groups)
                 return False
     return True
 
